@@ -3,6 +3,10 @@ import 'package:flutter/services.dart';
 import 'package:sizer/sizer.dart';
 
 import '../../core/app_export.dart';
+import '../../models/journal_entry_model.dart';
+import '../../services/journal_sync_service.dart';
+import '../../theme/app_theme.dart';
+import '../../widgets/custom_icon_widget.dart';
 import './widgets/ai_insights_panel_widget.dart';
 import './widgets/entry_content_widget.dart';
 import './widgets/entry_metadata_widget.dart';
@@ -21,15 +25,19 @@ class _JournalEntryDetailViewState extends State<JournalEntryDetailView>
   bool _isEditing = false;
   bool _hasUnsavedChanges = false;
   bool _showAIInsights = false;
+  bool _isLoading = true;
   late TextEditingController _contentController;
   late ScrollController _scrollController;
   late AnimationController _fadeController;
   late Animation<double> _fadeAnimation;
 
   // Entry data
+  JournalEntryModel? _entryModel;
   Map<String, dynamic> _entryData = {};
   String _originalContent = '';
   String _currentMood = '';
+
+  final JournalSyncService _journalService = JournalSyncService.instance;
 
   @override
   void initState() {
@@ -46,7 +54,6 @@ class _JournalEntryDetailViewState extends State<JournalEntryDetailView>
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _loadEntryData();
-      _fadeController.forward();
     });
   }
 
@@ -58,16 +65,69 @@ class _JournalEntryDetailViewState extends State<JournalEntryDetailView>
     super.dispose();
   }
 
-  void _loadEntryData() {
-    final args =
-        ModalRoute.of(context)?.settings.arguments as Map<String, dynamic>?;
-    if (args != null) {
+  Future<void> _loadEntryData() async {
+    try {
       setState(() {
-        _entryData = args;
-        _originalContent = _entryData['content'] ?? _entryData['preview'] ?? '';
-        _contentController.text = _originalContent;
-        _currentMood = _entryData['mood'] ?? 'neutral';
+        _isLoading = true;
       });
+
+      final args = ModalRoute.of(context)?.settings.arguments;
+
+      if (args == null) {
+        throw Exception('No entry data provided');
+      }
+
+      JournalEntryModel? entry;
+
+      // Handle both String ID and Map arguments for backward compatibility
+      if (args is String) {
+        // Load entry by ID using JournalSyncService
+        entry = await _journalService.getJournalEntry(args);
+        if (entry == null) {
+          throw Exception('Entry not found');
+        }
+      } else if (args is Map<String, dynamic>) {
+        // Convert Map to JournalEntryModel
+        try {
+          entry = JournalEntryModel.fromJson(args);
+        } catch (e) {
+          // If fromJson fails, try to extract ID and load the entry
+          final entryId = args['id'] as String?;
+          if (entryId != null) {
+            entry = await _journalService.getJournalEntry(entryId);
+          }
+          if (entry == null) {
+            throw Exception('Invalid entry data');
+          }
+        }
+      } else {
+        throw Exception('Invalid argument type');
+      }
+
+      setState(() {
+        _entryModel = entry;
+        _entryData = entry!.toJson();
+        _originalContent = entry.content;
+        _contentController.text = _originalContent;
+        _currentMood = entry.mood ?? 'neutral';
+        _isLoading = false;
+      });
+
+      _fadeController.forward();
+    } catch (e) {
+      setState(() {
+        _isLoading = false;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error loading entry: ${e.toString()}'),
+          backgroundColor: Colors.red,
+        ),
+      );
+
+      // Navigate back if entry couldn't be loaded
+      Navigator.pop(context);
     }
   }
 
@@ -75,52 +135,73 @@ class _JournalEntryDetailViewState extends State<JournalEntryDetailView>
     if (_hasUnsavedChanges) {
       final result = await showDialog<bool>(
         context: context,
-        builder: (context) => AlertDialog(
-          title: const Text('Unsaved Changes'),
-          content:
-              const Text('Do you want to save your changes before leaving?'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Discard'),
+        builder:
+            (context) => AlertDialog(
+              title: const Text('Unsaved Changes'),
+              content: const Text(
+                'Do you want to save your changes before leaving?',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(false),
+                  child: const Text('Discard'),
+                ),
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(null),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton(
+                  onPressed: () async {
+                    await _saveEntry();
+                    Navigator.of(context).pop(true);
+                  },
+                  child: const Text('Save'),
+                ),
+              ],
             ),
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(null),
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                _saveEntry();
-                Navigator.of(context).pop(true);
-              },
-              child: const Text('Save'),
-            ),
-          ],
-        ),
       );
       return result ?? false;
     }
     return true;
   }
 
-  void _saveEntry() {
-    setState(() {
-      _entryData['content'] = _contentController.text;
-      _entryData['mood'] = _currentMood;
-      _entryData['lastModified'] = DateTime.now();
-      _originalContent = _contentController.text;
-      _hasUnsavedChanges = false;
-      _isEditing = false;
-    });
+  Future<void> _saveEntry() async {
+    if (_entryModel == null) return;
 
-    HapticFeedback.lightImpact();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: const Text('Entry saved successfully'),
-        backgroundColor: AppTheme.lightTheme.colorScheme.primary,
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
+    try {
+      final updatedEntry = await _journalService.updateJournalEntry(
+        entryId: _entryModel!.id,
+        title: _entryData['title'],
+        content: _contentController.text,
+        mood: _currentMood,
+        entryDate: _entryModel!.entryDate,
+        isPinned: _entryModel!.isPinned,
+      );
+
+      setState(() {
+        _entryModel = updatedEntry;
+        _entryData = updatedEntry.toJson();
+        _originalContent = _contentController.text;
+        _hasUnsavedChanges = false;
+        _isEditing = false;
+      });
+
+      HapticFeedback.lightImpact();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Entry saved successfully'),
+          backgroundColor: AppTheme.lightTheme.colorScheme.primary,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to save entry: ${e.toString()}'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
   }
 
   void _toggleEditMode() {
@@ -161,6 +242,30 @@ class _JournalEntryDetailViewState extends State<JournalEntryDetailView>
 
   @override
   Widget build(BuildContext context) {
+    if (_isLoading) {
+      return Scaffold(
+        backgroundColor: AppTheme.lightTheme.scaffoldBackgroundColor,
+        appBar: AppBar(
+          backgroundColor: Colors.transparent,
+          elevation: 0,
+          title: const Text('Loading...'),
+        ),
+        body: const Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    if (_entryModel == null) {
+      return Scaffold(
+        backgroundColor: AppTheme.lightTheme.scaffoldBackgroundColor,
+        appBar: AppBar(
+          backgroundColor: Colors.transparent,
+          elevation: 0,
+          title: const Text('Entry Not Found'),
+        ),
+        body: const Center(child: Text('Journal entry could not be loaded.')),
+      );
+    }
+
     return WillPopScope(
       onWillPop: _onWillPop,
       child: Scaffold(
@@ -181,9 +286,7 @@ class _JournalEntryDetailViewState extends State<JournalEntryDetailView>
             ),
           ),
           title: Text(
-            _entryData['date'] != null
-                ? _formatDate(_entryData['date'] as DateTime)
-                : 'Journal Entry',
+            _formatDate(_entryModel!.entryDate),
             style: AppTheme.lightTheme.textTheme.titleMedium?.copyWith(
               fontWeight: FontWeight.w600,
             ),
@@ -194,6 +297,7 @@ class _JournalEntryDetailViewState extends State<JournalEntryDetailView>
                 onPressed: () {
                   setState(() {
                     _contentController.text = _originalContent;
+                    _currentMood = _entryModel!.mood ?? 'neutral';
                     _hasUnsavedChanges = false;
                     _isEditing = false;
                   });
@@ -226,55 +330,56 @@ class _JournalEntryDetailViewState extends State<JournalEntryDetailView>
               ),
               PopupMenuButton<String>(
                 onSelected: _handleMenuAction,
-                itemBuilder: (context) => [
-                  PopupMenuItem(
-                    value: 'share',
-                    child: Row(
-                      children: [
-                        CustomIconWidget(
-                          iconName: 'share',
-                          size: 4.w,
-                          color: AppTheme.lightTheme.colorScheme.onSurface,
+                itemBuilder:
+                    (context) => [
+                      PopupMenuItem(
+                        value: 'share',
+                        child: Row(
+                          children: [
+                            CustomIconWidget(
+                              iconName: 'share',
+                              size: 4.w,
+                              color: AppTheme.lightTheme.colorScheme.onSurface,
+                            ),
+                            SizedBox(width: 3.w),
+                            const Text('Share'),
+                          ],
                         ),
-                        SizedBox(width: 3.w),
-                        const Text('Share'),
-                      ],
-                    ),
-                  ),
-                  PopupMenuItem(
-                    value: 'export',
-                    child: Row(
-                      children: [
-                        CustomIconWidget(
-                          iconName: 'download',
-                          size: 4.w,
-                          color: AppTheme.lightTheme.colorScheme.onSurface,
+                      ),
+                      PopupMenuItem(
+                        value: 'export',
+                        child: Row(
+                          children: [
+                            CustomIconWidget(
+                              iconName: 'download',
+                              size: 4.w,
+                              color: AppTheme.lightTheme.colorScheme.onSurface,
+                            ),
+                            SizedBox(width: 3.w),
+                            const Text('Export'),
+                          ],
                         ),
-                        SizedBox(width: 3.w),
-                        const Text('Export'),
-                      ],
-                    ),
-                  ),
-                  PopupMenuItem(
-                    value: 'delete',
-                    child: Row(
-                      children: [
-                        CustomIconWidget(
-                          iconName: 'delete',
-                          size: 4.w,
-                          color: AppTheme.lightTheme.colorScheme.error,
+                      ),
+                      PopupMenuItem(
+                        value: 'delete',
+                        child: Row(
+                          children: [
+                            CustomIconWidget(
+                              iconName: 'delete',
+                              size: 4.w,
+                              color: AppTheme.lightTheme.colorScheme.error,
+                            ),
+                            SizedBox(width: 3.w),
+                            Text(
+                              'Delete',
+                              style: TextStyle(
+                                color: AppTheme.lightTheme.colorScheme.error,
+                              ),
+                            ),
+                          ],
                         ),
-                        SizedBox(width: 3.w),
-                        Text(
-                          'Delete',
-                          style: TextStyle(
-                            color: AppTheme.lightTheme.colorScheme.error,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
+                      ),
+                    ],
               ),
             ],
           ],
@@ -290,7 +395,7 @@ class _JournalEntryDetailViewState extends State<JournalEntryDetailView>
                   controller: _contentController,
                   isEditing: _isEditing,
                   onChanged: _onContentChanged,
-                  entryTitle: _entryData['title'] ?? '',
+                  entryTitle: _entryModel!.title,
                 ),
               ),
 
@@ -312,7 +417,7 @@ class _JournalEntryDetailViewState extends State<JournalEntryDetailView>
                 ),
 
               // AI Insights Panel
-              if (_entryData['hasAiInsight'] == true)
+              if (_entryModel!.hasAiInsight)
                 SliverToBoxAdapter(
                   child: AIInsightsPanelWidget(
                     entryData: _entryData,
@@ -324,15 +429,11 @@ class _JournalEntryDetailViewState extends State<JournalEntryDetailView>
               // Share & Export Options (only in view mode)
               if (!_isEditing)
                 SliverToBoxAdapter(
-                  child: ShareExportWidget(
-                    entryData: _entryData,
-                  ),
+                  child: ShareExportWidget(entryData: _entryData),
                 ),
 
               // Bottom padding
-              SliverToBoxAdapter(
-                child: SizedBox(height: 10.h),
-              ),
+              SliverToBoxAdapter(child: SizedBox(height: 10.h)),
             ],
           ),
         ),
@@ -375,10 +476,9 @@ class _JournalEntryDetailViewState extends State<JournalEntryDetailView>
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
-      builder: (context) => ShareExportWidget(
-        entryData: _entryData,
-        isBottomSheet: true,
-      ),
+      builder:
+          (context) =>
+              ShareExportWidget(entryData: _entryData, isBottomSheet: true),
     );
   }
 
@@ -392,39 +492,52 @@ class _JournalEntryDetailViewState extends State<JournalEntryDetailView>
     );
   }
 
-  void _deleteEntry() {
-    showDialog(
+  Future<void> _deleteEntry() async {
+    final confirm = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Delete Entry'),
-        content: Text(
-          'Are you sure you want to delete "${_entryData['title']}"? This action cannot be undone.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              Navigator.pop(context); // Close dialog
-              Navigator.pop(
-                  context, 'deleted'); // Return to dashboard with result
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: const Text('Entry deleted'),
-                  backgroundColor: AppTheme.lightTheme.colorScheme.error,
-                ),
-              );
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppTheme.lightTheme.colorScheme.error,
-              foregroundColor: Colors.white,
+      builder:
+          (context) => AlertDialog(
+            title: const Text('Delete Entry'),
+            content: Text(
+              'Are you sure you want to delete "${_entryModel!.title}"? This action cannot be undone.',
             ),
-            child: const Text('Delete'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              ElevatedButton(
+                onPressed: () => Navigator.pop(context, true),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppTheme.lightTheme.colorScheme.error,
+                  foregroundColor: Colors.white,
+                ),
+                child: const Text('Delete'),
+              ),
+            ],
           ),
-        ],
-      ),
     );
+
+    if (confirm == true) {
+      try {
+        await _journalService.deleteJournalEntry(_entryModel!.id);
+
+        Navigator.pop(context, 'deleted'); // Return to dashboard with result
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('Entry deleted'),
+            backgroundColor: AppTheme.lightTheme.colorScheme.error,
+          ),
+        );
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to delete entry: ${e.toString()}'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
   }
 }
